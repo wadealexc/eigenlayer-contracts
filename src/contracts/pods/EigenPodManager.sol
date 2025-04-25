@@ -95,6 +95,67 @@ contract EigenPodManager is
         pod.stake{value: msg.value}(pubkey, signature, depositDataRoot);
     }
 
+    /// @dev Maps migration destination to migration source. Set to true if
+    /// dest.podOwner has allowed migration from src.
+    mapping(IEigenPod dest => mapping(IEigenPod src => bool)) migrationApproved;
+
+    /// @dev Approve the migration of validators, shares, and slashing factors from one or more source pods
+    function approveMigration(IEigenPod dest, IEigenPod[] memory sources) public {
+        require(dest == ownerToPod[msg.sender], "");
+
+        for (uint256 i = 0; i < sources.length; i++) {
+            migrationApproved[dest][sources[i]] = true;
+        }
+    }
+
+    /// @dev Allows src.podOwner to consolidate all validators to the destination pod.
+    /// The destination pod will inherit the validators, shares, and any slashing experienced
+    /// from the source pod.
+    ///
+    /// For all intents and purposes, the source pod is "shut down"
+    function migrateAssets(IEigenPod src, IEigenPod dest, bytes memory destPubkey) public {
+        require(src != dest, "no? lol");
+        require(src == ownerToPod[msg.sender], "onlyOwner of src pod");
+
+        /// Ensure destination consents and has a valid consolidation recipient
+        require(migrationApproved[dest][src], "destination pod must approve migration");
+        require(dest.validatorPubkeyToInfo(destPubkey).status == VALIDATOR_STATUS.ACTIVE);
+
+        _checkValidWithdrawal(msg.sender);
+
+        uint256 beaconSlashingFactor = beaconChainSlashingFactor(podOwner);
+        uint256 depositScalingFactor = delegationManager.depositScalingFactor(msg.sender, beaconChainETHStrategy);
+
+        migrations[src] = dest;
+        src.startMigration(dest, destPubkey);
+    }
+
+    /// This migration method requires a very specific setup, and we reject anything that doesn't meet it 100%.
+    /// - podOwner should have only a single withdrawal in the queue containing all their beacon chain shares
+    /// - the withdrawal should only contain beacon chain shares
+    /// - withdrawal should be completable (maybe dont need this because we dont care if addtl slashing happens)
+    ///
+    /// When this withdrawal is completed, it must be completed "as tokens"
+    function _checkValidWithdrawal(address podOwner) internal view {
+        require(depositShares[podOwner] == 0, "All shares must be in queue");
+
+        /// Require the pod owner only has one withdrawal in the queue
+        ///
+        /// Note that in order to do this, we need to do a pre-upgrade step to make any withdrawals
+        /// with the beacon chain ETH strategy visible via this method (?)
+        /// ... that said, since pre-slashing withdrawals wouldn't be slashable, maybe we don't need this?
+        bytes32[] memory withdrawalRoots = delegationManager.getQueuedWithdrawalRoots(msg.sender);
+        require(withdrawalRoots.length == 1);
+
+        /// Require the withdrawal only contains the beacon chain ETH strategy
+        IDelegationManager.Withdrawal memory withdrawal = delegationManager.getQueuedWithdrawal(withdrawalRoots[0]);
+        require(withdrawal.strategies.length == 1 && withdrawal.strategies[0] == beaconChainETHStrategy);
+
+        // /// Require the withdrawal is completable
+        // uint32 slashableUntil = withdrawal.startBlock + delegationManager.minWithdrawalDelayBlocks();
+        // require(uint32(block.number) > slashableUntil);
+    }
+
     /// @inheritdoc IEigenPodManager
     function recordBeaconChainETHBalanceUpdate(
         address podOwner,
